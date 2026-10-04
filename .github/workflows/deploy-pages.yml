@@ -1,0 +1,63 @@
+# ShelfSync — deploy to GitHub Pages (https://rotaligatos.github.io/shelfsync/).
+# This repository holds the BUILT app only (index.html, sw.js, manifest, icons). The source lives in
+# Desktop\Shelfsync on Rommel's PC; build there (python build.py) and copy dist/index.html + sw.js here.
+# Requires: Settings -> Pages -> Source = "GitHub Actions".
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      # ShelfSync's libraries, served from the same address as the app so a blocked or slow CDN
+      # doesn't stop sign-in. Pinned versions, fetched with npm (which checks each package's hash).
+      # Never blocks the deploy: if a file can't be fetched the app loads it from the CDN as before.
+      - name: ShelfSync libraries (vendor)
+        continue-on-error: true
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/vendor"
+          cd "$RUNNER_TEMP"
+          get() {   # get <package> <output file> <path in package>...
+            pkg="$1"; out="$2"; shift 2
+            rm -rf package ./*.tgz
+            if ! npm pack --silent "$pkg" >/dev/null 2>&1 || ! tar xzf ./*.tgz; then echo "::warning::could not fetch $pkg"; return 0; fi
+            for f in "$@"; do
+              if [ -s "package/$f" ] && [ "$(wc -c < "package/$f")" -gt 1000 ]; then
+                cp "package/$f" "$GITHUB_WORKSPACE/vendor/$out"; echo "ok $out <- $pkg/$f"; return 0
+              fi
+            done
+            echo "::warning::$pkg has none of: $* — its .js files: $(cd package && find . -name '*.js' -size +1k | head -12 | tr '\n' ' ')"
+          }
+          get @supabase/supabase-js@2.45.4 supabase.min.js dist/umd/supabase.min.js dist/umd/supabase.js
+          get @simplewebauthn/browser@13.1.0 simplewebauthn-browser.umd.min.js dist/bundle/index.umd.min.js
+          get html5-qrcode@2.3.8 html5-qrcode.min.js html5-qrcode.min.js
+          get chart.js@4.4.1 chart.umd.min.js dist/chart.umd.min.js dist/chart.umd.js
+          get https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz xlsx.full.min.js dist/xlsx.full.min.js
+          ls -l "$GITHUB_WORKSPACE/vendor"
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
