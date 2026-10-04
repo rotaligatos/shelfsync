@@ -1294,7 +1294,7 @@ const TABLES = {
   delivery_history: { base: true, full: () => pageAll(() => SB.from("ss_delivery_history").select("*").order("id")) },
   monthly: { base: true, full: () => pageAll(() => SB.from("ss_v_monthly_sales").select("*").order("month").order("depot_id").order("product_id").order("created_by")),
     map: m => ({ ...m, month: String(m.month).slice(0, 7), units: Number(m.units), amount: Number(m.amount), receipts: Number(m.receipts) }) },
-  passkeys: { full: () => pageAll(() => SB.from("ss_passkeys").select("id,user_id,device_label,created_at,last_used_at").order("id")) },
+  passkeys: { full: () => pageAll(() => SB.from("ss_passkeys").select("id,user_id,credential_id,device_label,created_at,last_used_at").order("id")) },
   retailer_sales: { full: () => pageAll(() => SB.from("ss_retailer_sales").select("*").gte("period_end", sinceIso().slice(0, 10)).order("id")), map: r => ({ ...r, qty: Number(r.qty), amount: N(r.amount), ending_stock: N(r.ending_stock) }) },
   stock_checks: { inc: "updated_at", key: "id", keep: r => !CHECK_CLOSED.includes(r.status) || !r.updated_at || Date.parse(r.updated_at) >= Date.now() - 120 * DAY,
     q: () => SB.from("ss_stock_checks").select("*").or("status.in.(open,recount,counted),updated_at.gte." + new Date(Date.now() - 120 * DAY).toISOString()).order("id"),
@@ -2210,7 +2210,7 @@ function authView() {
     return `<div class="main"><div class="login narrow">${head}<div class="card stack bio-card">
       <div class="bio-icon">${ICON.finger}</div>
       <div class="stack-sm"><h2>${enrol ? "Set up this " + deviceNoun() : "Confirm it's you"}</h2>
-      <p class="muted">${enrol ? "ShelfSync uses " + esc(bioWord()) + " to confirm sign-in, stock requests, approvals and deliveries. It never leaves this " + deviceNoun() + "." + (Bio.has(u.id) ? " Your other device is already set up; each phone or computer is set up on its own." : "") : "Signed in as <b>" + esc(u.email || u.full_name) + "</b>. Use " + esc(bioWord()) + " to continue."}</p></div>
+      <p class="muted">${enrol ? "ShelfSync uses " + esc(bioWord()) + " to confirm sign-in, stock requests, approvals and deliveries. It never leaves this " + deviceNoun() + "." + (Bio.has(u.id) ? " Your other device is already set up; each phone or computer is set up on its own." : "") + (isPhone() ? "" : " No fingerprint reader needed: the PIN you use to unlock Windows works.") : "Signed in as <b>" + esc(u.email || u.full_name) + "</b>. Use " + esc(bioWord()) + " to continue."}</p></div>
       <button class="btn primary lg" id="bio-go" onclick="App.${enrol ? "authEnrol" : "authBio"}()">${ICON.finger}<span>${enrol ? "Set up this " + deviceNoun() : isPhone() ? "Use Face ID / fingerprint" : "Continue with " + esc(bioWord())}</span></button>
       ${enrol ? `${Bio.has(u.id) ? `<button class="btn" onclick="App.authBio()">Use my other device instead</button>` : ""}<button class="btn ghost" onclick="App.authSkipEnrol()">Not now on this ${deviceNoun()}</button><p class="small faint">${u.require_passkey === false ? "" : "Without it you can sign in, but requests, approvals, dispatch and receipts will ask you to confirm. "}You won't be asked again at sign-in on this ${deviceNoun()}; set it up any time in Menu › Face ID / fingerprint.</p>` : `<button class="btn ghost" onclick="App.authBack()">Use a different account</button>`}
     </div></div></div>`;
@@ -2255,14 +2255,20 @@ const deviceLabel = () => { const ua = navigator.userAgent;
 /* what this device's lock is called, so a laptop isn't asked for a "fingerprint" it doesn't have */
 const isPhone = () => /iPhone|iPad|Android/.test(navigator.userAgent);
 const bioWord = () => { const ua = navigator.userAgent;
-  return /iPhone|iPad/.test(ua) ? "Face ID / Touch ID" : /Android/.test(ua) ? "fingerprint or screen lock" : /Windows/.test(ua) ? "Windows Hello (PIN, face or fingerprint)" : /Mac/.test(ua) ? "Touch ID or your Mac password" : "this device's lock"; };
+  return /iPhone|iPad/.test(ua) ? "Face ID / Touch ID" : /Android/.test(ua) ? "fingerprint or screen lock" : /Windows/.test(ua) ? "your Windows Hello PIN" : /Mac/.test(ua) ? "Touch ID or your Mac password" : "this device's lock"; };
 const deviceNoun = () => /iPhone|iPad|Android/.test(navigator.userAgent) ? "phone" : /Windows|Mac|Linux|CrOS/.test(navigator.userAgent) ? "computer" : "device";
 const Bio = {
   /* the person has a key on SOME device */
   has(uid) { return (S.passkeys || []).some(k => k.user_id === (uid || (ME && ME.id))); },
   /* the person has a key on THIS device (live: remembered when it was set up or last used here) */
   here(uid) { uid = uid || (ME && ME.id); if (!uid || !Bio.has(uid)) return false; if (MODE !== "live") return true;
-    return (LS.get("shelfsync-cred-" + uid) || []).length > 0; },
+    return Bio.hereIds(uid).length > 0; },
+  /* this device's own keys: remembered here, still registered, and (on a computer) not a phone's key */
+  hereIds(uid) { uid = uid || (ME && ME.id);
+    const mine = LS.get("shelfsync-cred-" + uid) || [], phone = /phone|iPhone|iPad/i;
+    const keys = (S.passkeys || []).filter(k => k.user_id === uid);
+    if (!keys.some(k => k.credential_id)) return mine;                       // older data without ids: trust what's remembered
+    return keys.filter(k => k.credential_id && mine.includes(k.credential_id) && (isPhone() || !phone.test(k.device_label || ""))).map(k => k.credential_id); },
   /* "Not now" on this device: don't ask again at sign-in here */
   skippedHere(uid) { return !!LS.get("shelfsync-bio-skip-" + uid); },
   skipHere(uid) { LS.set("shelfsync-bio-skip-" + uid, new Date().toISOString()); },
@@ -2322,12 +2328,15 @@ const Bio = {
   async enroll(user = ME) {
     if (MODE === "live") {
       if (!navigator.onLine) throw new Error("Connect to the internet to set this up");
-      const opts = await fn(liveConfig().passkeyFunction, { op: "register-options" });
+      if (!isPhone() && window.PublicKeyCredential && PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable
+        && !(await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().catch(() => true)))
+        throw new Error(/Windows/.test(navigator.userAgent) ? "Windows Hello isn't set up on this computer. Open Windows Settings › Accounts › Sign-in options, add a PIN, then try again." : "This computer has no Touch ID or screen lock that ShelfSync can use.");
+      const opts = await fn(liveConfig().passkeyFunction, { op: "register-options", platform: !isPhone() });
       return Bio.prompt({ title: "Set up this " + deviceNoun(), body: "Use " + esc(bioWord()) + " to confirm sign-in, requests and approvals on this " + deviceNoun() + ".", button: "Set up on this " + deviceNoun(),
         run: async () => { const lib = await Bio.lib(); const att = await lib.startRegistration({ optionsJSON: opts });
           await fn(liveConfig().passkeyFunction, { op: "register-verify", response: att, device_label: deviceLabel() });
           Bio.rememberCred(user.id, att.id, att.authenticatorAttachment); LS.del("shelfsync-bio-skip-" + user.id);
-          S.passkeys = (S.passkeys || []).concat([{ id: uuid(), user_id: user.id, device_label: deviceLabel(), created_at: new Date().toISOString() }]); return true; } });
+          S.passkeys = (S.passkeys || []).concat([{ id: uuid(), user_id: user.id, credential_id: att.id, device_label: deviceLabel(), created_at: new Date().toISOString() }]); return true; } });
     }
     return Bio.prompt({ title: "Set up this " + deviceNoun(), body: "Use " + esc(bioWord()) + " to confirm sign-in, requests and approvals on this " + deviceNoun() + ".", button: "Set up on this " + deviceNoun(),
       run: async simulate => { const credential_id = simulate ? "sim-" + uuid() : await Bio.localCreate(user);
@@ -2341,7 +2350,8 @@ const Bio = {
     if (!Bio.has()) await Bio.enroll();
     else if (!Bio.here() && await Bio.chooseDevice() === "here") await Bio.enroll();
     if (MODE === "live") {
-      const opts = await fn(liveConfig().passkeyFunction, { op: "action-options", action_ref: actionRef });
+      const only = Bio.hereIds();
+      const opts = await fn(liveConfig().passkeyFunction, { op: "action-options", action_ref: actionRef, ...(only.length ? { only } : {}) });
       return Bio.prompt({ title: "Confirm it's you", body: esc(label), run: async () => {
         const lib = await Bio.lib(); const asr = await lib.startAuthentication({ optionsJSON: opts });
         const r = await fn(liveConfig().passkeyFunction, { op: "action-verify", action_ref: actionRef, response: asr }); Bio.rememberCred(ME.id, asr.id, asr.authenticatorAttachment); return r.confirm_id; } });
@@ -2367,7 +2377,8 @@ const Bio = {
   async verifyLogin(user) {
     if (MODE === "live" && (!navigator.onLine || !SB || user._offline)) return Bio.localUnlock(user);
     if (MODE === "live") {
-      const opts = await fn(liveConfig().passkeyFunction, { op: "action-options", action_ref: "login:" + user.id });
+      const only = Bio.hereIds(user.id);
+      const opts = await fn(liveConfig().passkeyFunction, { op: "action-options", action_ref: "login:" + user.id, ...(only.length ? { only } : {}) });
       return Bio.prompt({ title: "Confirm it's you", body: "Use " + esc(bioWord()) + ".", run: async () => {
         const lib = await Bio.lib(); const asr = await lib.startAuthentication({ optionsJSON: opts });
         await fn(liveConfig().passkeyFunction, { op: "action-verify", action_ref: "login:" + user.id, response: asr }); Bio.rememberCred(user.id, asr.id, asr.authenticatorAttachment); return true; } });
@@ -5316,7 +5327,7 @@ async function liveProfile() {
 }
 async function loadPasskeysAndSettings(uid) {
   try {
-    const [pk, st] = await Promise.all([SB.from("ss_passkeys").select("id,user_id,device_label,created_at,last_used_at"), SB.from("ss_settings").select("*")]);
+    const [pk, st] = await Promise.all([SB.from("ss_passkeys").select("id,user_id,credential_id,device_label,created_at,last_used_at"), SB.from("ss_settings").select("*")]);
     if (pk.error || st.error) throw pk.error || st.error;
     S = S || {}; S.users = S.users || []; S.passkeys = pk.data || []; S.settings = S.settings || {};
     (st.data || []).forEach(r => S.settings[r.key] = r.value);

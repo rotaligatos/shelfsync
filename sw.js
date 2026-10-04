@@ -1,6 +1,6 @@
 // ShelfSync service worker: the app and its libraries work offline; data calls always go to the network.
 // A new version installs in the background and takes over at once; the page offers "Reload" to use the new screens.
-const VERSION = "shelfsync-v23";
+const VERSION = "shelfsync-v24";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icons/icon-192.png", "./icons/icon-512.png", "./icons/co-wcli.png", "./icons/co-wcli-mark.png",
   "./icons/co-cwli.png", "./icons/co-cwli-mark.png", "./icons/rtmo.png"];
 // libraries: the copy published with the app (vendor/), else the CDN — same list as LIBS in src/20-data.js.
