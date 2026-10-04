@@ -2364,13 +2364,17 @@ const Bio = {
   /* no signal: the device itself confirms Face ID / fingerprint (the server checks again for every request or approval) */
   async localUnlock(user) {
     if (!window.PublicKeyCredential || !navigator.credentials) return true;      // no biometrics on this device: nothing to check here
-    const ids = user ? LS.get("shelfsync-cred-" + user.id) || [] : [];
+    // only this person's own keys may open their saved data: the ones remembered here, plus the ones the server listed for them
+    const listed = user ? (S.passkeys || []).concat((AUTH.snap && AUTH.snap.server && AUTH.snap.server.passkeys) || [])
+      .filter(k => k.user_id === user.id && k.credential_id).map(k => k.credential_id) : [];
+    const ids = user ? [...new Set((LS.get("shelfsync-cred-" + user.id) || []).concat(listed))] : [];
+    if (!ids.length) throw new Error("Connect to the internet once and confirm with Face ID / fingerprint on this device. After that it also opens offline.");
     const fromB64 = s => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((s.length + 3) % 4)), c => c.charCodeAt(0));
     return Bio.prompt({ title: "Confirm it's you", body: "No signal. Use this device's Face ID, fingerprint or Windows Hello to open what's saved on this phone" + (user ? " for " + esc(user.full_name) : "") + ".",
       run: async () => {
         const cred = await navigator.credentials.get({ publicKey: { challenge: crypto.getRandomValues(new Uint8Array(32)), userVerification: "required", timeout: 60000,
-          ...(ids.length ? { allowCredentials: ids.map(id => ({ type: "public-key", id: fromB64(id) })) } : {}) } });
-        if (ids.length && cred && !ids.includes(b64url(cred.rawId))) throw new Error("That's not the Face ID / fingerprint set up for " + (user ? user.full_name : "this account"));
+          allowCredentials: ids.map(id => ({ type: "public-key", id: fromB64(id) })) } });
+        if (!cred || !ids.includes(b64url(cred.rawId))) throw new Error("That's not the Face ID / fingerprint set up for " + (user ? user.full_name : "this account"));
         return true; } });
   },
   /* sign-in step after the password (or passwordless with email) */
