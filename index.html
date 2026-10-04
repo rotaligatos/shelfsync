@@ -2209,10 +2209,10 @@ function authView() {
     const u = AUTH.user, enrol = AUTH.step === "enrol";
     return `<div class="main"><div class="login narrow">${head}<div class="card stack bio-card">
       <div class="bio-icon">${ICON.finger}</div>
-      <div class="stack-sm"><h2>${enrol ? "Set up Face ID or fingerprint" : "Confirm it's you"}</h2>
-      <p class="muted">${enrol ? "ShelfSync uses this device's Face ID, fingerprint or Windows Hello to confirm sign-in, stock requests, approvals and deliveries. Your fingerprint never leaves the device." : "Signed in as <b>" + esc(u.email || u.full_name) + "</b>. Use this device's Face ID, fingerprint or Windows Hello to continue."}</p></div>
-      <button class="btn primary lg" id="bio-go" onclick="App.${enrol ? "authEnrol" : "authBio"}()">${ICON.finger}<span>${enrol ? "Set up on this device" : "Use Face ID / fingerprint"}</span></button>
-      ${enrol ? `<button class="btn ghost" onclick="App.authSkipEnrol()">Not now</button><p class="small faint">Without it you can sign in, but you can't submit requests, approve, dispatch or confirm deliveries.</p>` : `<button class="btn ghost" onclick="App.authBack()">Use a different account</button>`}
+      <div class="stack-sm"><h2>${enrol ? "Set up this " + deviceNoun() : "Confirm it's you"}</h2>
+      <p class="muted">${enrol ? "ShelfSync uses " + esc(bioWord()) + " to confirm sign-in, stock requests, approvals and deliveries. It never leaves this " + deviceNoun() + "." + (Bio.has(u.id) ? " Your other device is already set up; each phone or computer is set up on its own." : "") : "Signed in as <b>" + esc(u.email || u.full_name) + "</b>. Use " + esc(bioWord()) + " to continue."}</p></div>
+      <button class="btn primary lg" id="bio-go" onclick="App.${enrol ? "authEnrol" : "authBio"}()">${ICON.finger}<span>${enrol ? "Set up this " + deviceNoun() : isPhone() ? "Use Face ID / fingerprint" : "Continue with " + esc(bioWord())}</span></button>
+      ${enrol ? `${Bio.has(u.id) ? `<button class="btn" onclick="App.authBio()">Use my other device instead</button>` : ""}<button class="btn ghost" onclick="App.authSkipEnrol()">Not now on this ${deviceNoun()}</button><p class="small faint">${u.require_passkey === false ? "" : "Without it you can sign in, but requests, approvals, dispatch and receipts will ask you to confirm. "}You won't be asked again at sign-in on this ${deviceNoun()}; set it up any time in Menu › Face ID / fingerprint.</p>` : `<button class="btn ghost" onclick="App.authBack()">Use a different account</button>`}
     </div></div></div>`;
   }
   const demo = MODE === "demo";
@@ -2252,15 +2252,41 @@ function authView() {
    ===================================================================== */
 const deviceLabel = () => { const ua = navigator.userAgent;
   return /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) ? "iPad" : /Android/.test(ua) ? "Android phone" : /Windows/.test(ua) ? "Windows PC" : /Mac/.test(ua) ? "Mac" : "This device"; };
+/* what this device's lock is called, so a laptop isn't asked for a "fingerprint" it doesn't have */
+const isPhone = () => /iPhone|iPad|Android/.test(navigator.userAgent);
+const bioWord = () => { const ua = navigator.userAgent;
+  return /iPhone|iPad/.test(ua) ? "Face ID / Touch ID" : /Android/.test(ua) ? "fingerprint or screen lock" : /Windows/.test(ua) ? "Windows Hello (PIN, face or fingerprint)" : /Mac/.test(ua) ? "Touch ID or your Mac password" : "this device's lock"; };
+const deviceNoun = () => /iPhone|iPad|Android/.test(navigator.userAgent) ? "phone" : /Windows|Mac|Linux|CrOS/.test(navigator.userAgent) ? "computer" : "device";
 const Bio = {
+  /* the person has a key on SOME device */
   has(uid) { return (S.passkeys || []).some(k => k.user_id === (uid || (ME && ME.id))); },
+  /* the person has a key on THIS device (live: remembered when it was set up or last used here) */
+  here(uid) { uid = uid || (ME && ME.id); if (!uid || !Bio.has(uid)) return false; if (MODE !== "live") return true;
+    return (LS.get("shelfsync-cred-" + uid) || []).length > 0; },
+  /* "Not now" on this device: don't ask again at sign-in here */
+  skippedHere(uid) { return !!LS.get("shelfsync-bio-skip-" + uid); },
+  skipHere(uid) { LS.set("shelfsync-bio-skip-" + uid, new Date().toISOString()); },
+  forgetHere(uid) { LS.del("shelfsync-cred-" + uid); LS.del("shelfsync-bio-skip-" + uid); },
+  /* a key exists on another device only: set this one up, or use the other device */
+  chooseDevice() {
+    return new Promise((resolve, reject) => {
+      const bg = openSheet(`<div class="stack bio-card"><div class="bio-icon">${ICON.finger}</div><div class="stack-sm"><h2>This ${deviceNoun()} isn't set up yet</h2>
+        <p class="muted">Your confirmation is set up on another device. Set this ${deviceNoun()} up with ${esc(bioWord())}, or confirm with the other device.</p></div>
+        <button class="btn primary lg" id="bio-ch-here">${ICON.finger}<span>Set up this ${deviceNoun()}</span></button>
+        <button class="btn" id="bio-ch-other">Use my other device</button>
+        <button class="btn ghost" id="bio-ch-cancel">Cancel</button></div>`, { modal: true });
+      bg.querySelector("#bio-ch-here").onclick = () => { bg.remove(); resolve("here"); };
+      bg.querySelector("#bio-ch-other").onclick = () => { bg.remove(); resolve("other"); };
+      bg.querySelector("#bio-ch-cancel").onclick = () => { bg.remove(); reject(Object.assign(new Error("Cancelled"), { cancelled: true })); };
+    });
+  },
   required() { return bioPolicy().actions && !!ME && ME.require_passkey !== false; },
   async lib() { await loadLib("webauthn"); return window.SimpleWebAuthnBrowser; },
   /* sheet with a button: WebAuthn must start from a tap (Safari) */
   prompt({ title, body, button, run }) {
     return new Promise((resolve, reject) => {
       const bg = openSheet(`<div class="stack bio-card"><div class="bio-icon">${ICON.finger}</div><div class="stack-sm"><h2>${esc(title)}</h2><p class="muted">${body}</p></div>
-        <button class="btn primary lg" id="bio-run">${ICON.finger}<span>${esc(button || "Use Face ID / fingerprint")}</span></button>
+        <button class="btn primary lg" id="bio-run">${ICON.finger}<span>${esc(button || (isPhone() ? "Use Face ID / fingerprint" : "Confirm with " + bioWord()))}</span></button>
         <button class="btn ghost" id="bio-cancel">Cancel</button><p class="small" id="bio-msg" role="status"></p></div>`, { modal: true });
       let simulate = false;
       bg.querySelector("#bio-cancel").onclick = () => { bg.remove(); reject(Object.assign(new Error("Cancelled"), { cancelled: true })); };
@@ -2297,13 +2323,13 @@ const Bio = {
     if (MODE === "live") {
       if (!navigator.onLine) throw new Error("Connect to the internet to set this up");
       const opts = await fn(liveConfig().passkeyFunction, { op: "register-options" });
-      return Bio.prompt({ title: "Set up Face ID or fingerprint", body: "Register this device so you can confirm sign-in, requests and approvals.", button: "Set up on this device",
+      return Bio.prompt({ title: "Set up this " + deviceNoun(), body: "Use " + esc(bioWord()) + " to confirm sign-in, requests and approvals on this " + deviceNoun() + ".", button: "Set up on this " + deviceNoun(),
         run: async () => { const lib = await Bio.lib(); const att = await lib.startRegistration({ optionsJSON: opts });
           await fn(liveConfig().passkeyFunction, { op: "register-verify", response: att, device_label: deviceLabel() });
-          Bio.rememberCred(user.id, att.id);
+          Bio.rememberCred(user.id, att.id, att.authenticatorAttachment); LS.del("shelfsync-bio-skip-" + user.id);
           S.passkeys = (S.passkeys || []).concat([{ id: uuid(), user_id: user.id, device_label: deviceLabel(), created_at: new Date().toISOString() }]); return true; } });
     }
-    return Bio.prompt({ title: "Set up Face ID or fingerprint", body: "Register this device so you can confirm sign-in, requests and approvals.", button: "Set up on this device",
+    return Bio.prompt({ title: "Set up this " + deviceNoun(), body: "Use " + esc(bioWord()) + " to confirm sign-in, requests and approvals on this " + deviceNoun() + ".", button: "Set up on this " + deviceNoun(),
       run: async simulate => { const credential_id = simulate ? "sim-" + uuid() : await Bio.localCreate(user);
         const prev = ME; ME = ME || user; Engine.addPasskey({ id: uuid(), user_id: user.id, credential_id, device_label: deviceLabel() + (simulate ? " (simulated)" : ""), created_at: new Date().toISOString() }); ME = prev; bump(); return true; } });
   },
@@ -2312,17 +2338,19 @@ const Bio = {
     if (VIEWAS) { const e = new Error("View only: you're viewing as " + ME.full_name + ". Stop viewing to make changes."); toast(e.message, true); throw e; }
     if (!Bio.required()) return null;
     if (MODE === "live" && !navigator.onLine) throw new Error("Connect to the internet to confirm with Face ID / fingerprint");
-    if (!Bio.has()) { await Bio.enroll(); }
+    if (!Bio.has()) await Bio.enroll();
+    else if (!Bio.here() && await Bio.chooseDevice() === "here") await Bio.enroll();
     if (MODE === "live") {
       const opts = await fn(liveConfig().passkeyFunction, { op: "action-options", action_ref: actionRef });
-      return Bio.prompt({ title: "Confirm with Face ID / fingerprint", body: esc(label), run: async () => {
+      return Bio.prompt({ title: "Confirm it's you", body: esc(label), run: async () => {
         const lib = await Bio.lib(); const asr = await lib.startAuthentication({ optionsJSON: opts });
-        const r = await fn(liveConfig().passkeyFunction, { op: "action-verify", action_ref: actionRef, response: asr }); return r.confirm_id; } });
+        const r = await fn(liveConfig().passkeyFunction, { op: "action-verify", action_ref: actionRef, response: asr }); Bio.rememberCred(ME.id, asr.id, asr.authenticatorAttachment); return r.confirm_id; } });
     }
     return Bio.prompt({ title: "Confirm with Face ID / fingerprint", body: esc(label), run: async simulate => { if (!simulate) await Bio.localGet(ME); return "demo-" + uuid(); } });
   },
   /* the passkeys this person set up on this phone (so offline unlock accepts only theirs) */
-  rememberCred(uid, credId) { if (!uid || !credId) return; const k = "shelfsync-cred-" + uid, l = LS.get(k) || []; if (!l.includes(credId)) LS.set(k, l.concat([credId])); },
+  rememberCred(uid, credId, attachment) { if (!uid || !credId || attachment === "cross-platform") return;   // a phone used from a laptop is not "this device"
+    const k = "shelfsync-cred-" + uid, l = LS.get(k) || []; if (!l.includes(credId)) LS.set(k, l.concat([credId])); },
   /* no signal: the device itself confirms Face ID / fingerprint (the server checks again for every request or approval) */
   async localUnlock(user) {
     if (!window.PublicKeyCredential || !navigator.credentials) return true;      // no biometrics on this device: nothing to check here
@@ -2340,9 +2368,9 @@ const Bio = {
     if (MODE === "live" && (!navigator.onLine || !SB || user._offline)) return Bio.localUnlock(user);
     if (MODE === "live") {
       const opts = await fn(liveConfig().passkeyFunction, { op: "action-options", action_ref: "login:" + user.id });
-      return Bio.prompt({ title: "Confirm it's you", body: "Use this device's Face ID, fingerprint or Windows Hello.", run: async () => {
+      return Bio.prompt({ title: "Confirm it's you", body: "Use " + esc(bioWord()) + ".", run: async () => {
         const lib = await Bio.lib(); const asr = await lib.startAuthentication({ optionsJSON: opts });
-        await fn(liveConfig().passkeyFunction, { op: "action-verify", action_ref: "login:" + user.id, response: asr }); Bio.rememberCred(user.id, asr.id); return true; } });
+        await fn(liveConfig().passkeyFunction, { op: "action-verify", action_ref: "login:" + user.id, response: asr }); Bio.rememberCred(user.id, asr.id, asr.authenticatorAttachment); return true; } });
     }
     return Bio.prompt({ title: "Confirm it's you", body: "Use this device's Face ID, fingerprint or Windows Hello.", run: async simulate => { if (!simulate) await Bio.localGet(user); return true; } });
   },
@@ -2352,7 +2380,7 @@ const Bio = {
       const { options, challenge_id } = await fn(liveConfig().passkeyFunction, { op: "login-options" });
       return Bio.prompt({ title: "Sign in with Face ID / fingerprint", body: "Use the Face ID, fingerprint or Windows Hello you set up on this device.", run: async () => {
         const lib = await Bio.lib(); const asr = await lib.startAuthentication({ optionsJSON: options });
-        const r = await fn(liveConfig().passkeyFunction, { op: "login-verify", challenge_id, response: asr }); LS.set("shelfsync-pending-cred", asr.id);
+        const r = await fn(liveConfig().passkeyFunction, { op: "login-verify", challenge_id, response: asr }); if (asr.authenticatorAttachment !== "cross-platform") LS.set("shelfsync-pending-cred", asr.id);
         const { error } = await SB.auth.verifyOtp({ token_hash: r.token_hash, type: "email" }); if (error) throw error; return true; } });
     }
     const last = LS.get("shelfsync-last-user"), u = last && S.users.find(x => x.id === last);
@@ -4461,7 +4489,7 @@ const App = {
   },
   async authBio() { await busy(async () => { await Bio.verifyLogin(AUTH.user); finishLogin(AUTH.user, "login"); }); },
   async authEnrol() { await busy(async () => { await Bio.enroll(AUTH.user); toast("Face ID / fingerprint is set up on this device"); finishLogin(AUTH.user, "login"); }); },
-  authSkipEnrol() { finishLogin(AUTH.user, "login"); },
+  authSkipEnrol() { Bio.skipHere(AUTH.user.id); finishLogin(AUTH.user, "login"); },
   async authBack() { stopSync(); if (MODE === "live" && SB) { try { await SB.auth.signOut({ scope: "local" }); } catch (e) {} } AUTH.step = "login"; AUTH.user = null; render(); },
   async authOffline() { await busy(async () => { const x = AUTH.snap; if (!x) return; if (bioPolicy().login && x.me.require_passkey !== false) await Bio.localUnlock(x.me); enterOffline(x); }); },
   signOut(force) {
@@ -4551,11 +4579,11 @@ const App = {
   },
   bioMenu() {
     const keys = (S.passkeys || []).filter(k => k.user_id === ME.id);
-    openSheet(`<div class="stack"><h2>Face ID / fingerprint</h2><p class="muted small">Used to confirm sign-in, stock requests, approvals, dispatch and receipt on this account.</p>
+    openSheet(`<div class="stack"><h2>Face ID / fingerprint</h2><p class="muted small">Used to confirm sign-in, stock requests, approvals, dispatch and receipt on this account. Each phone or computer is set up on its own; on this ${deviceNoun()} it uses ${esc(bioWord())}.</p>
       ${keys.length ? `<div class="list">${keys.map(k => `<div class="row between"><span>${esc(k.device_label || "Device")}<div class="small faint">Added ${dshort(k.created_at)}${k.last_used_at ? " · last used " + dshort(k.last_used_at) : ""}</div></span></div>`).join("")}</div>` : `<div class="empty">No device set up yet.</div>`}
-      <div class="row"><button class="btn primary" onclick="closeSheets();App.addDevice()">${ICON.finger}<span>Set up this device</span></button>${keys.length ? `<button class="btn danger" onclick="App.resetKeys('${ME.id}')">Remove all</button>` : ""}<button class="btn ghost" onclick="closeSheets()">Close</button></div></div>`);
+      <div class="row">${Bio.here() ? `<p class="small muted">This ${deviceNoun()} is set up.</p>` : `<button class="btn primary" onclick="closeSheets();App.addDevice()">${ICON.finger}<span>Set up this ${deviceNoun()}</span></button>`}${keys.length ? `<button class="btn danger" onclick="App.resetKeys('${ME.id}')">Remove all</button>` : ""}<button class="btn ghost" onclick="closeSheets()">Close</button></div></div>`);
   },
-  async addDevice() { await busy(async () => { await Bio.enroll(); toast("Face ID / fingerprint is set up on this device"); rerender(); }); },
+  async addDevice() { await busy(async () => { await Bio.enroll(); toast("This " + deviceNoun() + " is set up"); rerender(); }); },
   theme() { const order = [undefined, "light", "dark"]; UI.theme = order[(order.indexOf(UI.theme) + 1) % 3]; applyTheme(); saveUI(); App.menu(); },
   async refresh() { closeSheets(); try { await loadLive(true, true); toast("Data refreshed"); } catch (e) { toast(friendlyErr(e), true); } },
   install() { closeSheets(); deferredInstall.prompt(); deferredInstall.userChoice.finally(() => deferredInstall = null); },
@@ -5182,7 +5210,7 @@ const App = {
   async undoImport(id) { await busy(async () => { await API.run("undoImport", { id }); toast("Import undone"); rerender(); }); },
 
   /* ---------- Command Center ---------- */
-  async resetKeys(id) { closeSheets(); await busy(async () => { await API.run("resetPasskeys", { user_id: id }); toast("Face ID / fingerprint removed. They'll set it up again at next sign-in."); rerender(); }); },
+  async resetKeys(id) { closeSheets(); await busy(async () => { await API.run("resetPasskeys", { user_id: id }); if (ME && id === ME.id) Bio.forgetHere(id); toast("Face ID / fingerprint removed. They'll set it up again at next sign-in."); rerender(); }); },
   editDepot(id, focus) { openSheet(depotForm(id ? idx.depot(id) : null), { wide: true }); App.depotRoutePreview();
     if (focus === "space") setTimeout(() => { const f = document.querySelector(".sheet fieldset.perms"); if (f) { f.scrollIntoView({ block: "center" }); const i = f.querySelector("input"); if (i) i.focus(); } }, 60); },
   depotRoutePreview() {
@@ -5301,7 +5329,11 @@ async function afterPassword(u) {
   if (accessBlocked(u)) return;
   if (MODE === "live") await loadPasskeysAndSettings(u.id);
   const pol = bioPolicy();
-  if (pol.login && u.require_passkey !== false) { AUTH.user = u; AUTH.step = Bio.has(u.id) || u._offline ? "bio" : "enrol"; render(); return; }
+  if (pol.login && u.require_passkey !== false) {
+    // ask for the key that is on THIS device; a key on the phone doesn't make the laptop ask for it
+    if (u._offline || Bio.here(u.id)) { AUTH.user = u; AUTH.step = "bio"; render(); return; }
+    if (!Bio.skippedHere(u.id)) { AUTH.user = u; AUTH.step = "enrol"; render(); return; }
+  }
   finishLogin(u, "login");
 }
 async function finishLogin(u, event) {
