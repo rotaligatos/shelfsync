@@ -813,6 +813,13 @@ const Engine = {
     rows.forEach(r => S.retailer_sales.push({ id: r.id || uuid(), source: "manual", created_by: ME.id, created_at: new Date().toISOString(), ...r }));
   },
   delRetailerSales({ ids }) { const k = new Set(ids); S.retailer_sales = S.retailer_sales.filter(r => !k.has(r.id)); },
+  chainCode({ product_id, account_id, code }) {
+    if (!hasRole("admin", "ppic", "scm")) throw new Error("Only Admin, PPIC or Supply Chain can match item codes");
+    const c = String(code || "").trim(); if (!c) throw new Error("Give the chain's item code");
+    S.products.forEach(p => { if (p.id !== product_id && p.attributes && p.attributes.codes && p.attributes.codes[account_id] === c) { const codes = { ...p.attributes.codes }; delete codes[account_id]; p.attributes = { ...p.attributes, codes }; } });
+    const p = S.products.find(x => x.id === product_id); if (!p) throw new Error("Item not found");
+    p.attributes = { ...(p.attributes || {}), codes: { ...((p.attributes || {}).codes || {}), [account_id]: c } };
+  },
   saveCapacity({ depot_id, account_id, rows }) {
     if (!hasRole("admin", "ppic", "scm")) throw new Error("Only Admin, PPIC or Supply Chain can set shelf space");
     S.capacity = S.capacity.filter(c => !(c.depot_id === (depot_id || null) && c.account_id === (depot_id ? null : account_id)))
@@ -946,7 +953,7 @@ const OP_TABLES = { sale: ["sales", "stock"], lost: ["lost_sales"], count: ["cou
   adjustAct: ["adjustments", "counts", "stock_checks", "movements", "stock"], countReview: ["counts"], addCheck: ["stock_checks"], movement: ["movements", "stock"], message: ["messages"],
   depotReport: ["depot_reports"], retailerSales: ["retailer_sales"], competitor: ["competitors"], updateStocks: ["stock"], updateDepot: ["depots"], document: ["documents"],
   request: ["requests"], reviewDelivery: ["movements"], advance: ["requests", "stock", "movements"], setOdoo: ["requests"], docReceived: ["documents"], ackReport: ["depot_reports"],
-  reportDef: ["report_defs"], delReportDef: ["report_defs"], delRetailerSales: ["retailer_sales"], saveCapacity: ["capacity"], aiRecs: ["ai_recs"],
+  reportDef: ["report_defs"], delReportDef: ["report_defs"], delRetailerSales: ["retailer_sales"], chainCode: ["products"], saveCapacity: ["capacity"], aiRecs: ["ai_recs"],
   saveDepot: ["depots"], saveAccount: ["accounts", "depots"], saveProduct: ["products", "prices"], resetPasskeys: ["passkeys"], updateSettings: ["settings"],
   voidSale: ["stock"], logAccess: [] };
 
@@ -1135,6 +1142,7 @@ const Remote = {
   async delReportDef(p) { chk(await SB.from("ss_report_defs").delete().eq("id", p.id)); },
   async retailerSales(p) { chk(await SB.from("ss_retailer_sales").upsert(p.rows.map(r => ({ ...r, client_uuid: r.id })), { onConflict: "id", ignoreDuplicates: true })); },
   async delRetailerSales(p) { chk(await SB.from("ss_retailer_sales").delete().in("id", p.ids)); },
+  async chainCode(p) { chk(await SB.rpc("ss_set_chain_code", { p_product: p.product_id, p_account: p.account_id, p_code: p.code })); },
   async saveCapacity(p) {
     const rows = p.rows.filter(r => r.max_qty !== "" && r.max_qty != null).map(r => ({ category: r.category, max_qty: Number(r.max_qty) }));
     const r = await SB.rpc("ss_save_capacity", { p_depot: p.depot_id || null, p_account: p.depot_id ? null : p.account_id, p_rows: rows });
@@ -4283,7 +4291,10 @@ function toDate(v) {
   const d = new Date(s); return isNaN(d) ? "" : isoDate(d);
 }
 const findDepot = v => { const s = normH(v); if (!s) return null; return S.depots.find(d => normH(d.code) === s) || S.depots.find(d => normH(d.name) === s) || S.depots.find(d => normH(d.name).includes(s) || s.includes(normH(d.name))); };
-const findItem = (v, companyHint) => { const s = String(v ?? "").trim().toLowerCase(); if (!s) return null;
+/* item by SKU or barcode; with an account, that chain's own item code (attributes.codes[account]) is tried first */
+const chainCodeOf = (p, acct) => p.attributes && p.attributes.codes ? String(p.attributes.codes[acct] ?? "").toLowerCase() : "";
+const findItem = (v, companyHint, account) => { const s = String(v ?? "").trim().toLowerCase(); if (!s) return null;
+  if (account) { const byCode = S.products.find(p => chainCodeOf(p, account) === s); if (byCode) return byCode; }
   const c = S.products.filter(p => !companyHint || p.company_id === companyHint); return c.find(p => p.sku.toLowerCase() === s) || c.find(p => (p.barcode || "") === s) || S.products.find(p => p.sku.toLowerCase() === s || (p.barcode || "") === s); };
 const findAccount = v => { const s = normH(v); return S.accounts.find(a => normH(a.id) === s) || S.accounts.find(a => normH(a.name) === s) || S.accounts.find(a => normH(a.name).includes(s) && s.length > 2); };
 const findPlant = v => { const s = normH(v); return S.plants.find(p => normH(p.id) === s) || S.plants.find(p => normH(p.name).includes(s) && s.length > 2); };
@@ -4329,13 +4340,14 @@ function importCheck() {
       const dv = g(r, "depot"), d = dv !== "" && dv != null ? findDepot(dv) : (I.depot ? idx.depot(I.depot) : null);
       if (!d) { e.push("Unknown depot " + (dv || "(none)")); if (dv) unknown.depots.add(String(dv)); } else rec.depot_id = d.id;
       if (I.kind === "stock_checks" && (g(r, "item") === "" || g(r, "item") == null)) rec.product_id = null;
-      else if (I.kind !== "targets") { const iv = g(r, "item"), p = findItem(iv, d && d.company_id); if (!p) { e.push("Unknown item " + iv); if (iv) unknown.items.add(String(iv)); } else rec.product_id = p.id; }
+      else if (I.kind !== "targets") { const iv = g(r, "item"), p = findItem(iv, d && d.company_id, d && d.account_id); if (!p) { e.push("Unknown item " + iv); if (iv) unknown.items.add(String(iv)); } else rec.product_id = p.id; }
     }
-    if (["sales_history", "retailer_sales", "opening_stock", "stock_history", "deliveries_history"].includes(I.kind)) { const q = toNum(g(r, "qty")); if (q == null || isNaN(q) || q < 0) e.push("Qty must be a number"); else rec.qty = q; }
+    if (["sales_history", "retailer_sales", "opening_stock", "stock_history", "deliveries_history"].includes(I.kind)) { const q = toNum(g(r, "qty")); if (q == null || isNaN(q) || (q < 0 && !(I.chain && ["sales_history", "retailer_sales"].includes(I.kind)))) e.push("Qty must be a number"); else if (q === 0 && I.chain && I.kind === "sales_history") e.push("Qty is 0"); else rec.qty = q; }
     if (I.kind === "sales_history") { rec.date = toDate(g(r, "date")); if (!rec.date) e.push("Bad date"); const a = toNum(g(r, "amount")), up = toNum(g(r, "unit_price"));
       rec.unit_price = up && !isNaN(up) ? up : a && !isNaN(a) && rec.qty ? a / rec.qty : rec.product_id ? priceFor(idx.product(rec.product_id), idx.depot(rec.depot_id)) : 0; rec.receipt = String(g(r, "receipt") || "").trim() || null; }
     if (I.kind === "retailer_sales") { rec.period_start = toDate(g(r, "period_start")) || I.from; rec.period_end = toDate(g(r, "period_end")) || I.to; if (!rec.period_start || !rec.period_end) e.push("Set the report period");
-      const a = toNum(g(r, "amount")); rec.amount = a != null && !isNaN(a) ? a : null; const es = toNum(g(r, "ending_stock")); rec.ending_stock = es != null && !isNaN(es) ? es : null; }
+      const a = toNum(g(r, "amount")); rec.amount = a != null && !isNaN(a) ? a : null; const es = toNum(g(r, "ending_stock")); rec.ending_stock = es != null && !isNaN(es) ? es : null;
+      if (!I.chain && rec.depot_id && (S.retailer_sales || []).some(x => x.depot_id === rec.depot_id && x.period_start === rec.period_start && x.period_end === rec.period_end)) e.push("This depot's report for this period is already in ShelfSync (undo that import first to replace it)"); }
     if (I.kind === "stock_history") { rec.date = toDate(g(r, "date")); if (!rec.date) e.push("Bad date"); }
     if (I.kind === "deliveries_history") { rec.received_on = toDate(g(r, "received_on")); rec.requested_on = toDate(g(r, "requested_on")) || null; rec.ref = String(g(r, "ref") || "") || null; if (!rec.received_on) e.push("Bad received date"); }
     if (I.kind === "stock_checks") { rec.reason = String(g(r, "reason") || "").trim(); const k = normH(g(r, "kind")).replace(/ /g, "_"); rec.kind = CHECK_KIND[k] ? k : (Object.keys(CHECK_KIND).find(x => normH(CHECK_KIND[x]) === normH(g(r, "kind"))) || "other");
@@ -4357,6 +4369,7 @@ function importCheck() {
         lead_time_min: toNum(g(r, "lead_time_min")) || 30, lead_time_max: toNum(g(r, "lead_time_max")) || 45, is_consolidation_dc: /^(y|yes|true|1)$/i.test(String(g(r, "is_dc") || "").trim()) });
       rec.exists = !!S.depots.find(d => d.code === rec.code);
     }
+    chainRowCheck(I, rec, e);
     rec._err = e; out.push(rec);
   });
   return { rows: out, ok: out.filter(r => !r._err.length), bad: out.filter(r => r._err.length), unknown };
@@ -4377,6 +4390,7 @@ PLANT_ROUTES.import = { view() {
       <div class="filters">${I.sheets && I.sheets.length > 1 ? `<label class="f">Sheet<select class="in" onchange="App.impSheet(this.value)">${I.sheets.map(s => opt(s, s, I.sheet)).join("")}</select></label>` : ""}
         <label class="f">Header is on row<input class="in" type="number" min="1" value="${I.headerRow + 1}" onchange="App.impHeader(this.value)"></label></div>
       <div class="grid-3">${K.fields.map(fieldSel).join("")}${priceSels}</div></div>
+    ${I.chain ? chainPanel(I, chk) : ""}
     <div class="card stack"><div class="card-h" style="margin:0"><h2>3 · Check and import</h2><span><span class="chip good">${chk.ok.length} ready</span> ${chk.bad.length ? `<span class="chip crit">${chk.bad.length} with problems</span>` : ""}</span></div>
       ${chk.unknown.depots.size || chk.unknown.items.size ? `<div class="notice">${chk.unknown.depots.size ? `<div><b>Depots not found:</b> ${Array.from(chk.unknown.depots).slice(0, 12).map(esc).join(", ")}${chk.unknown.depots.size > 12 ? "…" : ""}. Add them in Setup › Depots or import the depot list first.</div>` : ""}${chk.unknown.items.size ? `<div><b>Items not found:</b> ${Array.from(chk.unknown.items).slice(0, 12).map(esc).join(", ")}${chk.unknown.items.size > 12 ? "…" : ""}. Import the item master first.</div>` : ""}</div>` : ""}
       <div class="tbl-wrap"><table class="tbl"><thead><tr><th>Row</th>${K.fields.map(f => `<th>${esc(f[1])}</th>`).join("")}<th>Check</th></tr></thead><tbody>
@@ -4420,7 +4434,7 @@ async function applyImport(kind, rows, filename) {
     } else if (kind === "sales_history") {
       const gs = salesGroups();
       await ins("ss_sales", gs.map(g => ({ id: g.id, depot_id: g.depot_id, sold_at: g.sold_at, receipt_no: g.receipt_no, affects_stock: false, import_id: imp.id })));
-      await ins("ss_sale_lines", gs.flatMap(g => g.lines.map(l => ({ sale_id: g.id, product_id: l.product_id, qty: l.qty, unit_price: Math.round(l.unit_price * 100) / 100 }))).filter(l => l.qty > 0));
+      await ins("ss_sale_lines", gs.flatMap(g => g.lines.map(l => ({ sale_id: g.id, product_id: l.product_id, qty: l.qty, unit_price: Math.round(l.unit_price * 100) / 100 }))).filter(l => l.qty !== 0));
     } else if (kind === "retailer_sales") {
       await ins("ss_retailer_sales", rows.map(r => ({ depot_id: r.depot_id, product_id: r.product_id, period_start: r.period_start, period_end: r.period_end, qty: r.qty, amount: r.amount, ending_stock: r.ending_stock, source: /pdf|png|jpe?g|heic/i.test(filename) ? "pdf" : "excel", import_id: imp.id })));
     } else if (kind === "stock_history") await ins("ss_stock_snapshots", rows.map(r => ({ depot_id: r.depot_id, product_id: r.product_id, as_of: r.date, qty: r.qty, import_id: imp.id })));
@@ -4440,7 +4454,7 @@ async function applyImport(kind, rows, filename) {
   else if (kind === "depots") rows.slice().sort((a, b) => b.is_consolidation_dc - a.is_consolidation_dc).forEach(r => { const ex = S.depots.find(d => d.code === r.code); const { _n, _err, exists, ...d } = r; Engine.saveDepot({ depot: { ...(ex || {}), id: ex ? ex.id : uuid(), ...d, active: true } }); });
   else {
     S.imports.push(imp);
-    if (kind === "sales_history") salesGroups().forEach(g => { const ls = g.lines.filter(l => l.qty > 0); S.sales.push({ id: g.id, depot_id: g.depot_id, sold_at: g.sold_at, receipt_no: g.receipt_no, total_amount: ls.reduce((s, l) => s + l.qty * l.unit_price, 0), affects_stock: false, import_id: imp.id, created_by: ME.id });
+    if (kind === "sales_history") salesGroups().forEach(g => { const ls = g.lines.filter(l => l.qty !== 0); S.sales.push({ id: g.id, depot_id: g.depot_id, sold_at: g.sold_at, receipt_no: g.receipt_no, total_amount: ls.reduce((s, l) => s + l.qty * l.unit_price, 0), affects_stock: false, import_id: imp.id, created_by: ME.id });
       ls.forEach(l => S.sale_lines.push({ id: uuid(), sale_id: g.id, product_id: l.product_id, qty: l.qty, unit_price: l.unit_price })); });
     else if (kind === "retailer_sales") rows.forEach(r => S.retailer_sales.push({ id: uuid(), depot_id: r.depot_id, product_id: r.product_id, period_start: r.period_start, period_end: r.period_end, qty: r.qty, amount: r.amount, ending_stock: r.ending_stock, source: /pdf|png|jpe?g/i.test(filename) ? "pdf" : "excel", import_id: imp.id, created_by: ME.id, created_at: imp.created_at }));
     else if (kind === "stock_history") rows.forEach(r => S.snapshots.push({ id: uuid(), depot_id: r.depot_id, product_id: r.product_id, as_of: r.date, qty: r.qty, import_id: imp.id }));
@@ -4450,6 +4464,178 @@ async function applyImport(kind, rows, filename) {
     else if (kind === "opening_stock") { const by = {}; rows.forEach(r => (by[r.depot_id] = by[r.depot_id] || []).push(r)); Object.entries(by).forEach(([d, ls]) => Engine.count({ id: uuid(), depot_id: d, note: "Opening balance import: " + filename, lines: ls.map(l => ({ product_id: l.product_id, counted_qty: l.qty })) })); }
   }
   bump();
+}
+/* =====================================================================
+   CHAIN REPORTS (v24) — accounting's official depot sales reports, read as they come
+   - Wilcon "Consignment Report" (Crystal Reports .xls): one tab per month; the branch ("D23 - Depot 23 - …")
+     and the item ("231000000002 - CWLI …") are heading lines above their invoices; returns have a negative Return Qty.
+   - Cebu Belmont "SALES REPORT" (.xlsx): one tab per month; Location and Period above a TRANSACTION DATE / ITEM_CODE table.
+   Every month tab is flattened into one table that goes through the normal Import data checks.
+   The chain's item codes are kept on each item (attributes.codes[account]); unknown codes are matched once on screen.
+   ===================================================================== */
+const CHAIN_KINDS = ["retailer_sales", "sales_history"];
+const chainAoa = (wb, n) => XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: "" });
+const chainTxt = v => v instanceof Date ? isoDate(v) : String(v ?? "").replace(/\s+/g, " ").trim();
+function chainDate(v) {
+  if (v instanceof Date && !isNaN(v)) return isoDate(v);
+  if (typeof v === "number") return toDate(v) || "";
+  const s = String(v ?? "").trim(); if (!s) return "";
+  const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); if (m) return m[3] + "-" + m[1].padStart(2, "0") + "-" + m[2].padStart(2, "0");
+  const d = new Date(s); return isNaN(d) ? "" : isoDate(d);
+}
+const chainMonth = (y, m) => [isoDate(new Date(y, m, 1)), isoDate(new Date(y, m + 1, 0))];
+const MONTHS_EN = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"];
+
+function readWilconReport(wb) {
+  const lines = [], names = {}, tabs = [];
+  wb.SheetNames.forEach(sn => {
+    const A = chainAoa(wb, sn); if (!A.length) return;
+    const hi = A.findIndex(r => chainTxt(r[0]) === "Branch" && r.some(c => /inv\s*no/i.test(chainTxt(c))));
+    if (hi < 0 || !A.slice(0, hi).some(r => /consignment report/i.test(r.map(chainTxt).join(" ")))) return;
+    const H = {}; A[hi].forEach((c, i) => { const k = chainTxt(c).toLowerCase(); if (k && H[k] == null) H[k] = i; });
+    const col = (...n) => { for (const k of n) if (H[k] != null) return H[k]; return -1; };
+    const cInv = col("inv no."), cDate = col("inv date"), cOrd = col("order date"), cQty = col("qty sold"), cRet = col("return qty"), cNet = col("net amount");
+    if (cInv < 0 || cQty < 0 || cNet < 0) return;
+    let from = "", to = "";
+    A.slice(0, hi).forEach(r => { const m = r.map(chainTxt).join(" ").match(/Date Range From\s*:\s*(.+?)\s+To\s+(.+?)\s*$/i); if (m) { from = chainDate(m[1]); to = chainDate(m[2]); } });
+    let br = null, item = null, n = 0;
+    for (let i = hi + 1; i < A.length; i++) {
+      const r = A[i], a = chainTxt(r[0]);
+      let m = a.match(/^(D\d+)\s*-\s*(.+)$/i);
+      if (m) { br = { code: m[1].toUpperCase(), name: m[2].trim() }; item = null; (names[br.code] = names[br.code] || new Set()).add(br.name); continue; }
+      m = a.match(/^(\d{6,})\s*-\s*(.+)$/);
+      if (m) { item = { code: m[1], name: m[2].trim() }; continue; }
+      if (br && item && a.toUpperCase() === br.code && chainTxt(r[cInv])) {
+        const q = (toNum(r[cQty]) || 0) + (cRet >= 0 ? toNum(r[cRet]) || 0 : 0); if (!q) continue;
+        const date = chainDate(r[cDate]) || (cOrd >= 0 ? chainDate(r[cOrd]) : "");
+        lines.push({ date, branch: br.code, branchName: br.name, code: item.code, desc: item.name, qty: q, amount: toNum(r[cNet]) || 0,
+          receipt: (q < 0 ? "Return " : "") + chainTxt(r[cInv]), from: from || (date ? chainMonth(+date.slice(0, 4), +date.slice(5, 7) - 1)[0] : ""), to: to || (date ? chainMonth(+date.slice(0, 4), +date.slice(5, 7) - 1)[1] : ""), sheet: sn });
+        n++;
+      }
+    }
+    tabs.push({ sheet: sn, from, to, lines: n });
+  });
+  if (!tabs.length) return null;
+  const notes = Object.entries(names).filter(([, s]) => s.size > 1).map(([c, s]) => `Branch ${c} appears under more than one name: ${Array.from(s).join(" / ")}. Check whether the branch moved.`);
+  return { type: "wilcon", account: "WILCON", label: "Wilcon consignment report", lines, tabs, notes };
+}
+
+function readBelmontReport(wb) {
+  const lines = [], tabs = [];
+  wb.SheetNames.forEach(sn => {
+    const A = chainAoa(wb, sn); if (!A.length) return;
+    if (!A.slice(0, 8).some(r => /^sales report/i.test(chainTxt(r[0])))) return;
+    const hi = A.findIndex(r => r.some(c => chainTxt(c).toUpperCase() === "ITEM_CODE")); if (hi < 0) return;
+    const H = {}; A[hi].forEach((c, i) => { const k = chainTxt(c).toUpperCase(); if (k && H[k] == null) H[k] = i; });
+    const cDate = A[hi].findIndex(c => /DATE/i.test(chainTxt(c))), cItem = H.ITEM_CODE, cDesc = H.DESCRIPTION, cQty = H.QTY, cAmt = H.AMOUNT, cDoc = H.DOC_NO;
+    if (cDate < 0 || cQty == null) return;
+    let loc = "", from = "", to = "", label = "";
+    A.slice(0, hi).forEach(r => { const t = chainTxt(r[0]);
+      let m = t.match(/^Location:\s*(.+)$/i); if (m) loc = m[1].trim();
+      m = t.match(/^Period:\s*([A-Za-z]+)\s+(\d{4})/i); if (m) { const mi = MONTHS_EN.indexOf(m[1].toLowerCase()); if (mi >= 0) { [from, to] = chainMonth(+m[2], mi); label = m[1] + " " + m[2]; } } });
+    let n = 0;
+    for (let i = hi + 1; i < A.length; i++) {
+      const r = A[i], code = chainTxt(r[cItem]), date = chainDate(r[cDate]);
+      if (!code || !date || !/\d/.test(code)) continue;
+      const q = toNum(r[cQty]) || 0; if (!q) continue;
+      const amt = cAmt != null ? toNum(r[cAmt]) : null;
+      lines.push({ date, branch: loc, branchName: loc, code, desc: cDesc != null ? chainTxt(r[cDesc]) : "", qty: q, amount: amt != null && !isNaN(amt) ? amt : 0,
+        receipt: cDoc != null ? chainTxt(r[cDoc]) : "", from: from || chainMonth(+date.slice(0, 4), +date.slice(5, 7) - 1)[0], to: to || chainMonth(+date.slice(0, 4), +date.slice(5, 7) - 1)[1], sheet: sn });
+      n++;
+    }
+    tabs.push({ sheet: sn, from, to, lines: n, label, loc });
+  });
+  if (!tabs.length) return null;
+  const years = tabs.map(t => (t.from || "").slice(0, 4)).filter(Boolean), main = years.sort((a, b) => years.filter(y => y === b).length - years.filter(y => y === a).length)[0];
+  const notes = tabs.filter(t => t.from && t.from.slice(0, 4) !== main).map(t => `Tab "${t.sheet}" is for ${t.label} (the other tabs are ${main}). It is kept with its own dates.`);
+  return { type: "belmont", account: "BELMONT", label: "Cebu Belmont sales report", lines, tabs, notes };
+}
+
+/* the account this report belongs to, as set up in ShelfSync */
+function chainAccount(rep) { return S.accounts.find(a => a.id === rep.account) || findAccount(rep.type === "belmont" ? "Belmont" : "Wilcon"); }
+function chainDepotFor(rep, line) {
+  const a = chainAccount(rep); if (!a) return null;
+  const ds = S.depots.filter(d => d.account_id === a.id && !d.is_consolidation_dc);
+  if (rep.type === "wilcon") { const b = line.branch.toUpperCase(); return ds.find(d => d.code.toUpperCase() === b || d.code.toUpperCase().endsWith("-" + b)) || null; }
+  if (ds.length === 1) return ds[0];
+  const l = normH(line.branch); return l ? ds.find(d => normH(d.name).includes(l) || normH(d.code).includes(l)) || null : null;
+}
+function chainRead(wb) { return readWilconReport(wb) || readBelmontReport(wb); }
+
+/* flatten into the table the import screen reads: invoice lines for Sales history, one line per branch × item × month for Sales check */
+function chainTable(rep, kind) {
+  const depotCode = l => { const d = chainDepotFor(rep, l); return d ? d.code : (rep.type === "wilcon" ? l.branch + " - " + l.branchName : "Belmont " + l.branch); };
+  if (kind === "sales_history") {
+    const head = ["Date", "Depot", "Item code", "Description", "Qty", "Amount", "Receipt", "Report branch", "Tab"];
+    return [head, ...rep.lines.map(l => [l.date, depotCode(l), l.code, l.desc, l.qty, l.amount, l.receipt, l.branchName, l.sheet])];
+  }
+  const g = new Map();
+  rep.lines.forEach(l => { const dc = depotCode(l), k = dc + "|" + l.code + "|" + l.from + "|" + l.to;
+    const x = g.get(k) || { dc, code: l.code, desc: l.desc, from: l.from, to: l.to, qty: 0, amount: 0, branch: l.branchName, sheet: l.sheet };
+    x.qty += l.qty; x.amount += l.amount; g.set(k, x); });
+  const head = ["Depot", "Item code", "Description", "Qty", "Amount", "Period start", "Period end", "Report branch", "Tab"];
+  return [head, ...Array.from(g.values()).sort((a, b) => (a.from + a.dc).localeCompare(b.from + b.dc)).map(x => [x.dc, x.code, x.desc, Math.round(x.qty * 1000) / 1000, Math.round(x.amount * 100) / 100, x.from, x.to, x.branch, x.sheet])];
+}
+
+/* what is already in ShelfSync for these branches and dates, so the same report can't be imported twice */
+async function chainExisting(rep, kind) {
+  const ids = Array.from(new Set(rep.lines.map(l => chainDepotFor(rep, l)).filter(Boolean).map(d => d.id)));
+  const dates = rep.lines.map(l => l.date).filter(Boolean).sort(), set = new Set();
+  if (!ids.length) return set;
+  if (kind === "sales_history") {
+    const from = dates[0], to = dates[dates.length - 1];
+    const rows = MODE === "live" && SB
+      ? await pageAll(() => SB.from("ss_sales").select("depot_id,receipt_no,sold_at").in("depot_id", ids).not("import_id", "is", null).is("voided_at", null)
+          .gte("sold_at", from + "T00:00:00+08:00").lte("sold_at", to + "T23:59:59+08:00").order("id"))
+      : (S.sales || []).filter(s => ids.includes(s.depot_id) && s.import_id && !s.voided_at);
+    rows.forEach(s => set.add(s.depot_id + "|" + manilaDate(s.sold_at) + "|" + (s.receipt_no || "")));
+  } else {
+    const rows = MODE === "live" && SB
+      ? await pageAll(() => SB.from("ss_retailer_sales").select("depot_id,period_start,period_end").in("depot_id", ids).order("id"))
+      : (S.retailer_sales || []).filter(r => ids.includes(r.depot_id));
+    rows.forEach(r => set.add(r.depot_id + "|" + r.period_start + "|" + r.period_end));
+  }
+  return set;
+}
+
+/* load a chain report into the import screen (called from App.impFile, and when switching between Sales check and Sales history) */
+async function chainLoad(I, rep, file) {
+  if (!CHAIN_KINDS.includes(I.kind)) I.kind = "retailer_sales";
+  const rows = chainTable(rep, I.kind);
+  Object.assign(I, { file: file || I.file, chain: rep, sheets: null, sheet: null, rows, headerRow: 0, depot: "", from: "", to: "" });
+  I.map = guessMap(I.kind, rows[0].map(String));
+  try { I.existing = await chainExisting(rep, I.kind); } catch (e) { console.warn("chain existing", e); I.existing = null; }
+}
+/* the import check's extra rules for a chain report row */
+function chainRowCheck(I, rec, e) {
+  if (!I.chain || !I.existing || !rec.depot_id) return;
+  const k = I.kind === "sales_history" ? rec.depot_id + "|" + rec.date + "|" + (rec.receipt || "") : rec.depot_id + "|" + rec.period_start + "|" + rec.period_end;
+  if (I.existing.has(k)) e.push(I.kind === "sales_history" ? "Already in ShelfSync (this invoice was imported before)" : "This branch's report for this period is already in ShelfSync (undo that import first to replace it)");
+}
+
+/* the summary card + code matching shown above "Check and import" */
+function chainPanel(I, chk) {
+  const rep = I.chain; if (!rep) return "";
+  const months = rep.tabs.filter(t => t.lines), dates = rep.lines.map(l => l.from).filter(Boolean).sort(), ends = rep.lines.map(l => l.to).filter(Boolean).sort();
+  const total = rep.lines.reduce((s, l) => s + l.amount, 0), rets = rep.lines.filter(l => l.qty < 0);
+  const acct = chainAccount(rep), noDepot = Array.from(new Set(rep.lines.filter(l => !chainDepotFor(rep, l)).map(l => rep.type === "wilcon" ? l.branch + " - " + l.branchName : l.branch || "(no location)")));
+  const unknown = new Map(); rep.lines.forEach(l => { if (!findItem(l.code, null, acct && acct.id)) unknown.set(l.code, l.desc); });
+  const canMatch = hasRole("admin", "ppic", "scm") && acct && !viewOnly();
+  const company = (() => { const d = rep.lines.map(l => chainDepotFor(rep, l)).find(Boolean); return d ? d.company_id : null; })();
+  const items = S.products.filter(p => p.active !== false && (!company || p.company_id === company)).sort((a, b) => a.name.localeCompare(b.name));
+  return `<div class="card stack"><div class="card-h" style="margin:0"><h2>Read as: ${esc(rep.label)}</h2><span class="small faint">${esc(I.file || "")}</span></div>
+    <p class="small muted" style="margin:0">${months.length} month tab${months.length === 1 ? "" : "s"}${dates.length ? ", " + dshort(dates[0]) + " – " + dshort(ends[ends.length - 1]) : ""} · ${fmt(rep.lines.length)} invoice lines · ${peso(total)}${rets.length ? ` · ${rets.length} return${rets.length === 1 ? "" : "s"} (${peso(rets.reduce((s, l) => s + l.amount, 0))})` : ""}</p>
+    <div class="row"><span class="small muted">Use this report for</span>
+      ${CHAIN_KINDS.map(k => `<button class="btn small ${I.kind === k ? "primary" : ""}" onclick="App.chainKind('${k}')">${k === "retailer_sales" ? "Sales check (depot's official report)" : "Sales history (months with no promodiser)"}</button>`).join("")}</div>
+    <p class="small faint" style="margin:0">${I.kind === "retailer_sales" ? "One line per branch, item and month, returns netted. Compared with what promodisers encoded in Sales check." : "Every invoice as a sale (returns as negative lines). Use only for months with no promodiser encoding, or the sales count twice."}</p>
+    ${!acct ? `<div class="notice">There is no ${rep.type === "belmont" ? "Cebu Belmont" : "Wilcon"} account in ShelfSync yet. Add it in Setup › Accounts, with its branches.</div>` : ""}
+    ${noDepot.length ? `<div class="notice"><b>Branches not in ShelfSync:</b> ${noDepot.map(esc).join(", ")}. Add them in Setup › Depots${rep.type === "wilcon" ? " with a code ending in the Wilcon branch code (e.g. WIL-D23)" : ""}.</div>` : ""}
+    ${rep.notes.map(n => `<div class="notice">${esc(n)}</div>`).join("")}
+    ${unknown.size ? `<div class="stack-sm"><b>Item codes to match (${unknown.size})</b><span class="small muted">Pick the ShelfSync item for each ${esc(acct ? acct.name : "")} code. It's remembered for the next report.</span>
+      ${Array.from(unknown).map(([code, desc]) => `<div class="row" style="align-items:flex-end"><span style="min-width:280px"><span class="mono">${esc(code)}</span><br><span class="small muted">${esc(desc)}</span></span>
+        ${canMatch ? `<select class="in" id="cc-${esc(code)}" style="max-width:380px">${opt("", "Pick the item…", "")}${items.map(p => opt(p.id, p.sku + " · " + p.name, "")).join("")}</select>
+        <button class="btn small" onclick="App.chainMatch('${esc(code)}')">Save</button>` : `<span class="small faint">Admin, PPIC or Supply Chain can match it.</span>`}</div>`).join("")}</div>` : ""}
+  </div>`;
 }
 /* =====================================================================
    ACTIONS
@@ -5205,14 +5391,23 @@ const App = {
       } else {
         await loadXLSX();
         const wb = XLSX.read(await file.arrayBuffer(), { type: "array", cellDates: true });
-        UI.impWb = wb; const sheet = wb.SheetNames[0], rows = XLSX.utils.sheet_to_json(wb.Sheets[sheet], { header: 1, raw: true, defval: "" });
-        Object.assign(I, { file: file.name, sheets: wb.SheetNames, sheet, rows, headerRow: detectHeaderRow(rows) });
+        UI.impWb = wb;
+        const rep = chainRead(wb);       // accounting's Wilcon / Belmont report: read every month tab as it comes
+        if (rep) { if (!CHAIN_KINDS.includes(I.kind)) toast("This is a " + rep.label + " — set up for Sales check."); await chainLoad(I, rep, file.name); rerender(); return; }
+        const sheet = wb.SheetNames[0], rows = XLSX.utils.sheet_to_json(wb.Sheets[sheet], { header: 1, raw: true, defval: "" });
+        Object.assign(I, { file: file.name, chain: null, existing: null, sheets: wb.SheetNames, sheet, rows, headerRow: detectHeaderRow(rows) });
       }
       I.map = guessMap(I.kind, (I.rows[I.headerRow] || []).map(String)); rerender();
     } catch (e) { toast("Couldn't read the file: " + e.message, true); }
   },
   impSheet(name) { const I = UI.imp, rows = XLSX.utils.sheet_to_json(UI.impWb.Sheets[name], { header: 1, raw: true, defval: "" }); Object.assign(I, { sheet: name, rows, headerRow: detectHeaderRow(rows) }); I.map = guessMap(I.kind, (rows[I.headerRow] || []).map(String)); rerender(); },
   impHeader(v) { const I = UI.imp; I.headerRow = Math.max(0, Number(v) - 1); I.map = guessMap(I.kind, (I.rows[I.headerRow] || []).map(String)); rerender(); },
+  async chainKind(k) { const I = UI.imp; if (!I.chain || I.kind === k) return; I.kind = k; await chainLoad(I, I.chain); rerender(); },
+  async chainMatch(code) {
+    const I = UI.imp, rep = I.chain, a = rep && chainAccount(rep), sel = document.getElementById("cc-" + code); if (!a || !sel) return;
+    if (!sel.value) return toast("Pick the item first", true);
+    await busy(async () => { await API.run("chainCode", { product_id: sel.value, account_id: a.id, code }); toast("Saved: " + a.name + " code " + code + " → " + (idx.product(sel.value) || {}).sku); rerender(); });
+  },
   impMap(k, v) { if (v === "") delete UI.imp.map[k]; else UI.imp.map[k] = Number(v); rerender(); },
   impTemplate() { const K = IMPORT_KINDS[UI.imp.kind]; exportRows("ShelfSync template - " + K.label, K.fields.map(f => f[1]).concat(K.extraHeaders || []), K.example, "Template"); },
   async runImport() {
