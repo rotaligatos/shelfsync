@@ -80,6 +80,10 @@ button,input,select,textarea{font:inherit;color:inherit}
 .co-logos{display:flex;align-items:center;gap:6px;flex:none}
 .co-logo{display:block;height:28px;width:auto;background:#fff;border:1px solid var(--line);border-radius:7px;padding:3px 6px;box-sizing:content-box}
 .co-logos.big .co-logo{height:40px;padding:5px 9px}
+/* v27: on a phone the two big logos wrap and shrink instead of pushing the sign-in card off the screen */
+.co-logos.big{flex-wrap:wrap;max-width:100%;flex:0 1 auto;min-width:0}
+.co-logos.big .co-logo{max-width:100%;object-fit:contain}
+@media (max-width:480px){.co-logos.big .co-logo{height:32px;padding:4px 7px}}
 .made-by{display:inline-flex;align-items:center;gap:8px;font-size:.75rem;color:var(--muted,#888);text-decoration:none;justify-self:center}
 .made-by img{height:30px;width:auto;background:#fff;border-radius:6px;padding:3px 6px;border:1px solid var(--line)}
 @media (max-width:639px){.topbar .brand span{display:none}}
@@ -1226,6 +1230,15 @@ function liveConfig() {
   if (c.supabaseUrl && /^https:\/\/[a-z0-9-]+\.supabase\.co\/?$/i.test(c.supabaseUrl) && c.supabaseAnonKey) { out.supabaseUrl = c.supabaseUrl.replace(/\/$/, ""); out.supabaseAnonKey = c.supabaseAnonKey; }
   return out;
 }
+/* What the email link brought (read before Supabase takes the address apart): a password reset link signs the
+   person in with "type=recovery"; a used or expired link comes back with an error instead. v27 */
+const AUTH_LINK = (() => {
+  try {
+    const h = new URLSearchParams((location.hash || "").replace(/^#/, "")), q = new URLSearchParams(location.search);
+    const g = k => h.get(k) || q.get(k);
+    return { recovery: g("type") === "recovery", error: g("error_code") || g("error") || null, text: g("error_description") || "" };
+  } catch (e) { return { recovery: false, error: null, text: "" }; }
+})();
 async function initLive() {
   const cfg = liveConfig();
   if (!cfg.supabaseUrl || !cfg.supabaseAnonKey) return false;
@@ -2213,6 +2226,22 @@ function authView() {
   if (AUTH.step === "nolib") return `<div class="main"><div class="login narrow">${head}<div class="card stack">
       <h2>Can't reach ShelfSync</h2><p class="muted">The app couldn't connect. Check the signal or Wi-Fi, then try again.</p>
       <button class="btn primary" onclick="location.reload()">Try again</button></div></div></div>`;
+  if (AUTH.step === "newpw") {
+    const u = AUTH.user || {};
+    return `<div class="main"><div class="login narrow">${head}<div class="card stack">
+      <div class="stack-sm"><h2>Set a new password</h2>
+        <p class="muted">You opened the reset link for <b>${esc(u.email || "")}</b>. Choose the password you'll use next time you sign in with email.</p></div>
+      <form class="stack-sm" onsubmit="event.preventDefault();App.saveNewPassword()">
+        <input type="email" autocomplete="username" value="${esc(u.email || "")}" hidden readonly>
+        <label class="f">New password<input class="in" id="np-1" type="password" autocomplete="new-password" minlength="8" required></label>
+        <label class="f">Type it again<input class="in" id="np-2" type="password" autocomplete="new-password" minlength="8" required></label>
+        <label class="row small" style="gap:8px;align-items:center;cursor:pointer"><input type="checkbox" onchange="['np-1','np-2'].forEach(i=>document.getElementById(i).type=this.checked?'text':'password')"> Show password</label>
+        <p class="small faint">At least 8 characters. Capital and small letters count as different.</p>
+        <p class="small" id="np-msg" role="status"></p>
+        <button class="btn primary lg" type="submit" id="np-go">Save new password</button>
+        <button class="btn ghost" type="button" onclick="App.skipNewPassword()">Not now</button>
+      </form></div></div></div>`;
+  }
   if (AUTH.step === "bio" || AUTH.step === "enrol") {
     const u = AUTH.user, enrol = AUTH.step === "enrol";
     return `<div class="main"><div class="login narrow">${head}<div class="card stack bio-card">
@@ -2232,13 +2261,13 @@ function authView() {
       <div class="login-hero">${head}<h1>Every depot shelf, in sync with the Plant.</h1>
         <p class="muted">Sign in with the Google account you use for the company's other apps. Agency promodisers use the Google account (or email) the ShelfSync admin registered for them.</p></div>
       <div class="card stack">
-        <h2>Sign in</h2>
+        <h2>Sign in</h2>${AUTH.notice ? `<div class="notice" role="status">${esc(AUTH.notice)}</div>` : ""}
         ${demo ? `<button class="btn lg google" type="button" onclick="App.googleSignIn()">${GOOGLE_G}<span>Continue with Google</span></button>` : `<div id="g-btn" class="g-btn"><span class="small muted">Loading Google sign-in…</span></div><p class="small" id="g-msg" role="status"></p>`}
         <button class="btn" type="button" onclick="App.passkeySignIn()">${ICON.finger}<span>Sign in with Face ID / fingerprint</span></button>
         <p class="small faint">Face ID / fingerprint sign-in works after you've signed in with Google once on this device.</p>
-        <details class="pw"><summary>No Google account? Use email and password</summary>
+        <details class="pw"${AUTH.pwOpen ? " open" : ""}><summary>No Google account? Use email and password</summary>
           <form class="stack-sm" style="margin-top:10px" onsubmit="event.preventDefault();App.signIn()">
-            <label class="f">Email<input class="in" id="lg-email" type="email" autocomplete="username" inputmode="email" required></label>
+            <label class="f">Email<input class="in" id="lg-email" type="email" autocomplete="username" inputmode="email" required value="${esc(AUTH.email || "")}"></label>
             <label class="f">Password<input class="in" id="lg-pass" type="password" autocomplete="current-password" required></label>
             <button class="btn primary" type="submit">Sign in</button>
             <button class="btn ghost small" type="button" onclick="App.forgot()">Forgot password?</button>
@@ -4667,7 +4696,8 @@ const App = {
       return afterPassword(u);
     }
     const { error } = await SB.auth.signInWithPassword({ email, password: pass });
-    if (error) return toast(error.message === "Invalid login credentials" ? "Email or password is incorrect" : error.message, true);
+    if (error) { AUTH.email = email; return toast(error.message === "Invalid login credentials" ? "Email or password is incorrect. Capital and small letters count. Forgot it? Tap “Forgot password?”" : error.message, true); }
+    AUTH.notice = null; AUTH.pwOpen = false;
     const prof = await liveProfile(); if (prof) afterPassword(prof);
   },
   async googleSignIn() {
@@ -4685,8 +4715,38 @@ const App = {
   },
   forgot() {
     if (MODE === "demo") return toast("Demo: the password for every account is demo1234");
-    const email = val("lg-email").trim(); if (!email) return toast("Enter your email first", true);
-    SB.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname }).then(({ error }) => toast(error ? error.message : "Check your email for a reset link", !!error));
+    const email = val("lg-email").trim().toLowerCase(); if (!email) return toast("Enter your email first, then tap Forgot password", true);
+    const wait = Math.ceil(((LS.get("shelfsync-reset-at") || 0) + 60e3 - Date.now()) / 1000);
+    if (wait > 0) return toast("A reset email was just sent. Check your inbox (and Spam) — or wait " + wait + " s to send another.", true);
+    AUTH.email = email;
+    SB.auth.resetPasswordForEmail(email, { redirectTo: location.origin + location.pathname }).then(({ error }) => {
+      if (!error) { LS.set("shelfsync-reset-at", Date.now()); AUTH.notice = "Reset email sent to " + email + ". Open the newest email and tap its link — it works once. Check Spam if it isn't there."; return rerenderAuth(); }
+      const m = String(error.message || "");
+      toast(/rate limit|security purposes|429/i.test(m + error.status)
+        ? "Too many reset emails were sent. Wait about an hour, or ask the ShelfSync admin for a new temporary password."
+        : m, true);
+    });
+  },
+  async saveNewPassword() {
+    const a = val("np-1"), b = val("np-2"), msg = t => { const el = document.getElementById("np-msg"); if (el) el.textContent = t || ""; };
+    if (a.length < 8) return msg("Use at least 8 characters.");
+    if (a !== b) return msg("The two passwords don't match. Type them again.");
+    const btn = document.getElementById("np-go"); if (btn) btn.disabled = true; msg("Saving…");
+    let error = null;
+    try { ({ error } = await SB.auth.updateUser({ password: a })); } catch (e) { error = e; }
+    if (btn) btn.disabled = false;
+    if (error) {
+      const m = String(error.message || error);
+      return msg(/different from the old/i.test(m) ? "That is your current password. Choose a new one, or tap Not now."
+        : /weak|short|characters/i.test(m) ? "That password is too easy to guess. Try a longer one." : isNetErr(error) ? "No connection — check your signal and try again." : "Couldn't save: " + m);
+    }
+    const u = AUTH.user; LS.del(PW_PENDING); LS.del("shelfsync-reset-at");
+    toast("New password saved. Use it next time you sign in with email.");
+    if (u) await afterPassword(u);
+  },
+  async skipNewPassword() {
+    const u = AUTH.user; LS.del(PW_PENDING);
+    if (u) await afterPassword(u); else { AUTH.step = "login"; render(); }
   },
   async authBio() { await busy(async () => { await Bio.verifyLogin(AUTH.user); finishLogin(AUTH.user, "login"); }); },
   async authEnrol() { await busy(async () => { await Bio.enroll(AUTH.user); toast("Face ID / fingerprint is set up on this device"); finishLogin(AUTH.user, "login"); }); },
@@ -5577,6 +5637,8 @@ function enterOffline(snap) {
   Q.use(ME.id); useSnapshot(snap); render();
   toast("No signal. Working with the data saved on this phone (" + dtime(snap.at) + ").");
 }
+/* login screen again after "Forgot password?", keeping the email box open with its notice (v27) */
+function rerenderAuth() { AUTH.pwOpen = true; if (!ME) render(); }
 /* =====================================================================
    STOCK TO VERIFY — a stock figure whose history doesn't add up is used, but marked until someone confirms it.
    Marks come from Import data › "Stock to verify" (the files' own inconsistencies) or are added here.
@@ -6746,6 +6808,8 @@ async function onBackOnline() {
 }
 
 /* restore a live session: still asks for Face ID / fingerprint once per app launch */
+const PW_PENDING = "shelfsync-pw-pending";
+function cleanAuthLink() { try { if (location.hash || /[?&](type|error|error_code|code)=/.test(location.search)) history.replaceState(null, "", location.pathname); } catch (e) {} }
 async function bootLive() {
   let session = null;
   if (SB) { try { const { data } = await SB.auth.getSession(); session = data && data.session; } catch (e) {} }
@@ -6753,8 +6817,17 @@ async function bootLive() {
     const prof = await liveProfile().catch(e => { toast(friendlyErr(e), true); return null; });
     if (!prof) { if (AUTH.step !== "blocked") { ME = null; render(); } return; }
     if (accessBlocked(prof)) return;
+    // came from "Forgot password?": choose the new password before anything else (also if the app was closed on that screen)
+    if (AUTH_LINK.recovery) { LS.set(PW_PENDING, prof.id); cleanAuthLink(); }
+    if (LS.get(PW_PENDING) === prof.id) { AUTH.step = "newpw"; AUTH.user = prof; render(); return; }
     if (sess.get(BIO_OK) === prof.id) return finishLogin(prof, "resume");
     return afterPassword(prof);
+  }
+  if (AUTH_LINK.error) {                 // a reset link that was already used, expired, or opened twice
+    cleanAuthLink(); AUTH.pwOpen = true;
+    AUTH.notice = /expired|invalid|otp/i.test(AUTH_LINK.error + " " + AUTH_LINK.text)
+      ? "That reset link was already used or has expired. Each link works only once. Tap “Forgot password?” for a new one and open only the newest email."
+      : "The email link didn't work (" + (AUTH_LINK.text || AUTH_LINK.error) + "). Tap “Forgot password?” to get a new one.";
   }
   // no session here: with no signal, open with what's saved on this phone
   const last = LS.get("shelfsync-last-user"), snap = last && !LS.get("shelfsync-signed-out") ? await loadSnapshot(last) : null;
