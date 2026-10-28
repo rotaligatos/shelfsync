@@ -616,6 +616,12 @@ function stockMap() {
   return CACHE.stockMap = m;
 }
 const onHand = (d,p) => (stockMap().get(d + "|" + p) || {}).on_hand || 0;
+/* every code an item answers to: its own barcode, plus each chain's shelf barcode and item code
+   (attributes.barcodes / attributes.codes, e.g. Wilcon 231000000004, BQ Builders 8877334500085 / CJ003/0008) */
+function itemCodes(p) {
+  const a = (p && p.attributes) || {};
+  return [p.barcode, ...Object.values(a.barcodes || {}), ...Object.values(a.codes || {})].filter(v => v != null && v !== "").map(String);
+}
 function priceFor(p, depot) {
   if (!CACHE.prices) { CACHE.prices = new Map(); (S.prices || []).forEach(r => CACHE.prices.set(r.product_id + "|" + r.account_id, Number(r.price))); }
   const v = depot ? CACHE.prices.get(p.id + "|" + depot.account_id) : undefined;
@@ -2549,12 +2555,12 @@ function miniChain(r) {
   const steps = CHAIN.slice(r.origin === "ppic" ? 1 : 0); const cur = steps.findIndex(c => c.status === r.status);
   return `<div class="chain" aria-label="Approval progress">${steps.map((c, i) => `<div class="st ${i < cur || r.status === "received" ? "done" : i === cur ? "now" : ""}"><span class="pin"></span>${esc(c.short)}</div>`).join("")}</div>`;
 }
-/* one item from a scan or typed text: exact barcode or SKU (any letter case), else the only name / SKU match */
+/* one item from a scan or typed text: exact barcode (ours or the chain's), chain item code or SKU (any letter case), else the only name / SKU match */
 function scanItem(q) {
   q = String(q || "").trim().toLowerCase(); if (!q) return null;
   const ps = myProducts();
-  const exact = ps.find(p => (p.barcode || "").toLowerCase() === q || String(p.sku).toLowerCase() === q); if (exact) return exact;
-  const hits = ps.filter(p => (p.name + " " + p.sku + " " + (p.barcode || "")).toLowerCase().includes(q));
+  const exact = ps.find(p => String(p.sku).toLowerCase() === q || itemCodes(p).some(c => c.toLowerCase() === q)); if (exact) return exact;
+  const hits = ps.filter(p => (p.name + " " + p.sku + " " + itemCodes(p).join(" ")).toLowerCase().includes(q));
   return hits.length === 1 ? hits[0] : null;
 }
 /* "Customer asked, couldn't sell": one of our items (out of stock or not carried here), or something we don't sell at all */
@@ -2643,7 +2649,7 @@ const PROMO_ROUTES = {
 
   sell: { view() {
     const dp = myDepot(), q = (UI.sellQ || "").trim().toLowerCase();
-    const results = q ? myProducts().filter(p => (p.name + " " + p.sku + " " + (p.barcode || "")).toLowerCase().includes(q)).slice(0, 8) : [];
+    const results = q ? myProducts().filter(p => (p.name + " " + p.sku + " " + itemCodes(p).join(" ")).toLowerCase().includes(q)).slice(0, 8) : [];
     const todays = S.sales.filter(s => s.depot_id === dp.id && daysAgo(s.sold_at) === 0).sort((a, b) => b.sold_at.localeCompare(a.sold_at));
     return `<div class="stack">
       <h1>Record sale</h1>
@@ -2817,7 +2823,7 @@ function drCard(dp) {
   const draft = UI.drDraft || [];
   if (!UI.drOpen) return `<div class="card row between"><div class="grow"><b>Delivery arrived without a request?</b><div class="small faint">Record it here so your stock is right. PPIC checks it afterwards.</div></div><button class="btn" onclick="UI.drOpen=true;rerender()">Record delivery</button></div>`;
   const q = (UI.drQ || "").trim().toLowerCase();
-  const res = q ? myProducts().filter(p => (p.name + " " + p.sku + " " + (p.barcode || "")).toLowerCase().includes(q)).slice(0, 8) : [];
+  const res = q ? myProducts().filter(p => (p.name + " " + p.sku + " " + itemCodes(p).join(" ")).toLowerCase().includes(q)).slice(0, 8) : [];
   return `<div class="card stack-sm"><div class="card-h" style="margin:0"><h2>Delivery without a request</h2><button class="btn ghost small" onclick="App.drCancel()">Cancel</button></div>
     <p class="small muted">Use this only when items arrived and there is no request for them above. Enter the DR number, every item and quantity, and a photo of the DR. It adds to your stock now; PPIC checks it.</p>
     <label class="f">DR no. (required)<input class="in" id="dr-no" value="${esc(UI.drNo || "")}" oninput="UI.drNo=this.value" placeholder="e.g. 118204"></label>
@@ -2830,7 +2836,7 @@ function drCard(dp) {
     <button class="btn primary lg" ${draft.length ? "" : "disabled"} onclick="App.drSave()">Add to stock</button></div>`;
 }
 function reqResults(dp) {
-  const q = (UI.rqQ || "").trim().toLowerCase(), ps = myProducts().filter(p => (p.name + " " + p.sku + " " + (p.barcode || "")).toLowerCase().includes(q)).slice(0, 8);
+  const q = (UI.rqQ || "").trim().toLowerCase(), ps = myProducts().filter(p => (p.name + " " + p.sku + " " + itemCodes(p).join(" ")).toLowerCase().includes(q)).slice(0, 8);
   if (!ps.length) return `<div class="empty">No item matches “${esc(UI.rqQ)}”.</div>`;
   return `<div class="list">${ps.map(p => { const s = idx.stock(dp.id, p.id), pq = pipelineQty(dp.id, p.id), way = pq.transit + pq.pending;
     return `<div class="row between">${prodCell(p, " · " + fmt(s ? s.on_hand : 0) + " on hand" + (s && s.min_display ? " · min " + fmt(s.min_display) : "") + (way ? ` · <span class="chip info">${fmt(way)} already requested</span>` : ""))}
@@ -4189,7 +4195,7 @@ function accountForm(a) {
 function cmdItems() {
   const co = UI.ciCo || "WCLI", q = (UI.ciQ || "").toLowerCase();
   const accts = S.accounts.filter(a => S.depots.some(d => d.account_id === a.id && d.company_id === co && !d.is_consolidation_dc));
-  const list = S.products.filter(p => p.company_id === co && (!q || (p.sku + " " + p.name + " " + (p.barcode || "")).toLowerCase().includes(q)));
+  const list = S.products.filter(p => p.company_id === co && (!q || (p.sku + " " + p.name + " " + itemCodes(p).join(" ")).toLowerCase().includes(q)));
   const pr = (p, a) => { const r = (S.prices || []).find(x => x.product_id === p.id && x.account_id === a.id); return r ? peso(r.price) : '<span class="faint">SRP</span>'; };
   return `<div class="row between"><div class="filters"><label class="f">Company<select class="in" id="ci-co" onchange="UI.ciCo=this.value;rerender()">${S.companies.map(c => opt(c.id, c.id + " · " + c.name, co)).join("")}</select></label>
       <label class="f">Search<input class="in" id="ci-q" value="${esc(UI.ciQ || "")}" placeholder="SKU, name, barcode" oninput="UI.ciQ=this.value" onchange="rerender()"></label></div>
@@ -4324,7 +4330,8 @@ const findDepot = v => { const s = normH(v); if (!s) return null; return S.depot
 const chainCodeOf = (p, acct) => p.attributes && p.attributes.codes ? String(p.attributes.codes[acct] ?? "").toLowerCase() : "";
 const findItem = (v, companyHint, account) => { const s = String(v ?? "").trim().toLowerCase(); if (!s) return null;
   if (account) { const byCode = S.products.find(p => chainCodeOf(p, account) === s); if (byCode) return byCode; }
-  const c = S.products.filter(p => !companyHint || p.company_id === companyHint); return c.find(p => p.sku.toLowerCase() === s) || c.find(p => (p.barcode || "") === s) || S.products.find(p => p.sku.toLowerCase() === s || (p.barcode || "") === s); };
+  const c = S.products.filter(p => !companyHint || p.company_id === companyHint); return c.find(p => p.sku.toLowerCase() === s) || c.find(p => (p.barcode || "") === s) || S.products.find(p => p.sku.toLowerCase() === s || (p.barcode || "") === s)
+    || S.products.find(p => itemCodes(p).some(x => x.toLowerCase() === s)); };
 const findAccount = v => { const s = normH(v); return S.accounts.find(a => normH(a.id) === s) || S.accounts.find(a => normH(a.name) === s) || S.accounts.find(a => normH(a.name).includes(s) && s.length > 2); };
 const findPlant = v => { const s = normH(v); return S.plants.find(p => normH(p.id) === s) || S.plants.find(p => normH(p.name).includes(s) && s.length > 2); };
 
@@ -6053,7 +6060,7 @@ function compareMatrix(data, dim, m, opts = {}) {
   let rows = Array.from(R.values());
   if (dim === "sku") {
     const q = (opts.q || "").trim().toLowerCase();
-    if (q) rows = rows.filter(r => { const p = idx.product(r.k) || {}; return ((p.sku || "") + " " + (p.name || "") + " " + (p.barcode || "")).toLowerCase().includes(q); });
+    if (q) rows = rows.filter(r => { const p = idx.product(r.k) || {}; return ((p.sku || "") + " " + (p.name || "") + " " + itemCodes(p).join(" ")).toLowerCase().includes(q); });
     // carried items that didn't sell anywhere still show (as zeros) when a type is picked or searched
   }
   rows.sort((a, b) => b.total - a.total);
@@ -6182,7 +6189,7 @@ function bestData(data) {
   return CACHE[key] = { items, total: data.total, depots: dep };
 }
 function bestOverall(B, m, q) {
-  const t = (q || "").trim().toLowerCase(), list = B.items.filter(x => !t || (x.p.sku + " " + x.p.name + " " + (x.p.barcode || "")).toLowerCase().includes(t)), N = B.depots.length;
+  const t = (q || "").trim().toLowerCase(), list = B.items.filter(x => !t || (x.p.sku + " " + x.p.name + " " + itemCodes(x.p).join(" ")).toLowerCase().includes(t)), N = B.depots.length;
   return `<div class="tbl-wrap"><table class="tbl"><thead><tr><th class="r">#</th><th style="min-width:220px">Item</th><th>Type</th><th class="r">Sales ₱</th><th class="r">Units</th><th class="r">Share</th>
       <th class="r" title="Depots that sold it in the period, of the depots in this view">Selling at</th><th>Sells best at</th><th class="r" title="Avg sales per depot that sells it">Per selling depot</th>
       <th class="r" title="Depots in this view with no stock line for it: a chance to place it">Not carried at</th><th class="r" title="Units customers asked for that couldn't be sold">Asked, couldn't sell</th></tr></thead><tbody>
